@@ -23,10 +23,15 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import colorama
+import time
+import traceback
 import webbrowser
 import datetime
 from datetime import date
 from typing import TYPE_CHECKING
+from collections import OrderedDict
+from functools import partial
 
 from electrum.address_synchronizer import TX_HEIGHT_LOCAL
 from electrum.i18n import _
@@ -57,38 +62,129 @@ TX_ICONS = [
     "confirmed.png",
 ]
 
+class HistorySortModel(QSortFilterProxyModel):
+    def lessThan(self, source_left: QModelIndex, source_right: QModelIndex):
+        item1 = self.sourceModel().itemFromIndex(source_left).text()
+        item2 = self.sourceModel().itemFromIndex(source_right).text()
+        try:
+            return float(item1) < float(item2)
+        except ValueError:
+            return item1 < item2
 
-class HistoryList(MyTreeWidget, AcceptFileDragDrop):
-    filter_columns = [2, 3, 4]  # Date, Description, Amount
+class HistoryList(QTreeView, AcceptFileDragDrop):
+    filter_columns = [1, 2, 3]  # Date, Description, Amount
+
+    def hide_row(self, proxy_row):
+        for column in self.filter_columns:
+            source_idx = self.proxy.mapToSource(self.proxy.index(proxy_row, column))
+            txt = self.std_model.itemFromIndex(source_idx).text().lower()
+            if self.current_filter in txt:
+                self.setRowHidden(proxy_row, QModelIndex(), False)
+                break
+        else:
+            self.setRowHidden(proxy_row, QModelIndex(), True)
+
+    def filter(self, p):
+        p = p.lower()
+        self.current_filter = p
+        for row in range(self.proxy.rowCount()):
+            self.hide_row(row)
 
     def __init__(self, parent=None):
-        MyTreeWidget.__init__(self, parent, self.create_menu, [], 3)
+        QTreeView.__init__(self, parent)
+        self.setUniformRowHeights(True)
+        self.current_filter = ''
+        self.blue_brush = QBrush(QColor("#1E1EFF"))
+        self.red_brush = QBrush(QColor("#BC1E1E"))
+        self.monospace_font = QFont(MONOSPACE_FONT)
+        self.editable_columns = {2}
+        self.parent = parent
+        self.default_color = self.parent.app.palette().text().color()
+        self.config = parent.config
+        #MyTreeWidget.__init__(self, parent, self.create_menu, [], 3)
         AcceptFileDragDrop.__init__(self, ".txn")
-        self.refresh_headers()
-        self.setColumnHidden(1, True)
+        #self.setColumnHidden(1, True)
         self.setSortingEnabled(True)
-        self.sortByColumn(0, Qt.AscendingOrder)
         self.start_timestamp = None
         self.end_timestamp = None
         self.years = []
         self.create_toolbar_buttons()
         self.wallet = None
+        self.stretch_column = 3
+
+        self.proxy = HistorySortModel(self)
+        self.std_model = QStandardItemModel(self)
+        self.proxy.setSourceModel(self.std_model)
+        self.setModel(self.proxy)
+        root = self.std_model.invisibleRootItem()
+        self.icon_cache = IconCache()
+
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self.create_menu)
+
+        self.setItemDelegate(ElectrumItemDelegate(self))
+
+        self.initial()
+        self.refresh_headers()
+        self.sortByColumn(1, Qt.DescendingOrder)
+
+    def keyPressEvent(self, event):
+        if event.key() in [ Qt.Key_F2, Qt.Key_Return ]:
+            self.edit(self.selectionModel().currentIndex().siblingAtColumn(2))
+            return
+        super().keyPressEvent(event)
+
+    def createEditor(self, parent, option, index):
+        editor = QStyledItemDelegate.createEditor(self.itemDelegate(),
+                                                       parent, option, index)
+        editor.editingFinished.connect(partial(self.on_edited, index))
+        return editor
 
     def format_date(self, d):
         return str(datetime.date(d.year, d.month, d.day)) if d else _('None')
 
     def refresh_headers(self):
-        headers = ['', '', _('Date'), _('Description'), _('Amount'), _('Balance')]
+        headers = ['', _('Date'), _('Description'), _('Amount'), _('Balance')]
         fx = self.parent.fx
         if fx and fx.show_history():
             headers.extend(['%s '%fx.ccy + _('Value')])
-            self.editable_columns |= {6}
+            self.editable_columns |= {5}
             if fx.get_history_capital_gains_config():
                 headers.extend(['%s '%fx.ccy + _('Acquisition price')])
                 headers.extend(['%s '%fx.ccy + _('Capital Gains')])
         else:
-            self.editable_columns -= {6}
+            self.editable_columns -= {5}
         self.update_headers(headers)
+
+    @profiler
+    def update_headers(self, headers):
+        print('update headers')
+        col_count = self.std_model.columnCount()
+        diff = col_count-len(headers)
+        if col_count > len(headers):
+            if diff == 2:
+                self.std_model.removeColumns(6, diff)
+            else:
+                assert diff in [1, 3]
+                self.std_model.removeColumns(5, diff)
+            for items in self.txid_to_items.values():
+                for _ in range(diff):
+                    items.pop()
+        elif col_count < len(headers):
+            while self.std_model.rowCount():
+                self.std_model.removeRow(0)
+            self.initial()
+        self.std_model.setHorizontalHeaderLabels(headers)
+        self.header().setStretchLastSection(False)
+        for col in range(len(headers)):
+            sm = QHeaderView.Stretch if col == self.stretch_column else QHeaderView.ResizeToContents
+            self.header().setSectionResizeMode(col, sm)
+
+    def create_toolbar(self, config):
+        pass
+
+    def show_toolbar(self, show):
+        pass
 
     def get_domain(self):
         '''Replaced in address_dialog.py'''
@@ -213,88 +309,159 @@ class HistoryList(MyTreeWidget, AcceptFileDragDrop):
                 _("Perhaps some dependencies are missing...") + " (matplotlib?)")
             return
         try:
-            plt = plot_history(self.transactions)
+            plt = plot_history(list(self.transactions.values()))
             plt.show()
         except NothingToPlotException as e:
             self.parent.show_message(str(e))
 
     @profiler
-    def on_update(self):
+    def initial(self):
         self.wallet = self.parent.wallet  # type: Abstract_Wallet
         fx = self.parent.fx
         r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=self.start_timestamp, to_timestamp=self.end_timestamp, fx=fx)
-        self.transactions = r['transactions']
+        self.transactions = OrderedDict([(x['txid'], x) for x in r['transactions']])
         self.summary = r['summary']
         if not self.years and self.transactions:
-            start_date = self.transactions[0].get('date') or date.today()
-            end_date = self.transactions[-1].get('date') or date.today()
+            start_date = next(iter(self.transactions.values())).get('date') or date.today()
+            end_date = next(iter(reversed(self.transactions.values()))).get('date') or date.today()
             self.years = [str(i) for i in range(start_date.year, end_date.year + 1)]
             self.period_combo.insertItems(1, self.years)
-        item = self.currentItem()
-        current_tx = item.data(0, Qt.UserRole) if item else None
-        self.clear()
         if fx: fx.history_used_spot = False
-        blue_brush = QBrush(QColor("#1E1EFF"))
-        red_brush = QBrush(QColor("#BC1E1E"))
-        monospace_font = QFont(MONOSPACE_FONT)
-        for tx_item in self.transactions:
-            tx_hash = tx_item['txid']
-            height = tx_item['height']
-            conf = tx_item['confirmations']
-            timestamp = tx_item['timestamp']
-            value = tx_item['value'].value
-            balance = tx_item['balance'].value
-            label = tx_item['label']
-            tx_mined_status = TxMinedStatus(height, conf, timestamp, None)
-            status, status_str = self.wallet.get_tx_status(tx_hash, tx_mined_status)
-            has_invoice = self.wallet.invoices.paid.get(tx_hash)
-            icon = self.icon_cache.get(":icons/" + TX_ICONS[status])
-            v_str = self.parent.format_amount(value, is_diff=True, whitespaces=True)
-            balance_str = self.parent.format_amount(balance, whitespaces=True)
-            entry = ['', tx_hash, status_str, label, v_str, balance_str]
-            fiat_value = None
-            if value is not None and fx and fx.show_history():
-                fiat_value = tx_item['fiat_value'].value
-                value_str = fx.format_fiat(fiat_value)
-                entry.append(value_str)
-                # fixme: should use is_mine
-                if value < 0:
-                    entry.append(fx.format_fiat(tx_item['acquisition_price'].value))
-                    entry.append(fx.format_fiat(tx_item['capital_gain'].value))
-            item = SortableTreeWidgetItem(entry)
-            item.setIcon(0, icon)
-            item.setToolTip(0, str(conf) + " confirmation" + ("s" if conf != 1 else ""))
-            item.setData(0, SortableTreeWidgetItem.DataRole, (status, conf))
-            if has_invoice:
-                item.setIcon(3, self.icon_cache.get(":icons/seal"))
-            for i in range(len(entry)):
-                if i>3:
-                    item.setTextAlignment(i, Qt.AlignRight | Qt.AlignVCenter)
-                if i!=2:
-                    item.setFont(i, monospace_font)
-            if value and value < 0:
-                item.setForeground(3, red_brush)
-                item.setForeground(4, red_brush)
-            if fiat_value and not tx_item['fiat_default']:
-                item.setForeground(6, blue_brush)
-            if tx_hash:
-                item.setData(0, Qt.UserRole, tx_hash)
-            self.insertTopLevelItem(0, item)
-            if current_tx == tx_hash:
-                self.setCurrentItem(item)
+        self.txid_to_items = {}
+        for tx_item in self.transactions.values():
+            self.insert_tx(tx_item)
 
-    def on_edited(self, item, column, prior):
-        '''Called only when the text actually changes'''
-        key = item.data(0, Qt.UserRole)
-        text = item.text(column)
+    #def assert_consistency(self):
+    #    for idx, txid in list(enumerate(self.transactions.keys())):
+    #        txid_in_row = self.std_model.item(idx).data(Qt.UserRole)
+    #        assert txid_in_row == txid, (txid_in_row, txid, idx)
+
+    def insert_tx(self, tx_item):
+        fx = self.parent.fx
+        tx_hash = tx_item['txid']
+        height = tx_item['height']
+        conf = tx_item['confirmations']
+        timestamp = tx_item['timestamp']
+        value = tx_item['value'].value
+        balance = tx_item['balance'].value
+        label = tx_item['label']
+        tx_mined_status = TxMinedStatus(height, conf, timestamp, None)
+        status, status_str = self.wallet.get_tx_status(tx_hash, tx_mined_status)
+        has_invoice = self.wallet.invoices.paid.get(tx_hash)
+        icon = self.icon_cache.get(":icons/" + TX_ICONS[status])
+        v_str = self.parent.format_amount(value, is_diff=True, whitespaces=True)
+        balance_str = self.parent.format_amount(balance, whitespaces=True)
+        entry = ['', status_str, label, v_str, balance_str]
+        cap_gains = self.parent.fx.get_history_capital_gains_config()
+        history = self.parent.fx.show_history()
+        if history:
+            entry.append('')
+        if cap_gains:
+            entry.append('')
+            entry.append('')
+        fiat_value = None
+        item = [QStandardItem(e) for e in entry]
+        if has_invoice:
+            item[2].setIcon(self.icon_cache.get(":icons/seal"))
+        for i in range(len(entry)):
+            self.set_item_properties(item[i], i, tx_hash)
+        if value and value < 0:
+            item[2].setForeground(self.red_brush)
+            item[3].setForeground(self.red_brush)
+        self.txid_to_items[tx_hash] = item
+        self.update_item(tx_hash, self.parent.wallet.get_tx_height(tx_hash))
+        if history:
+            self.update_fiat(tx_hash, tx_item)
+        source_row_idx = self.std_model.rowCount()
+        self.std_model.insertRow(source_row_idx, item)
+        self.hide_row(self.proxy.mapFromSource(self.std_model.index(source_row_idx, 0)).row())
+
+    def set_item_properties(self, item, i, tx_hash):
+        if i>2:
+            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        if i!=1:
+            item.setFont(self.monospace_font)
+        if i not in self.editable_columns:
+            item.setEditable(False)
+        item.setData(tx_hash, Qt.UserRole)
+
+    #def ensure(self, items, idx, txid):
+    #    while len(items) < idx + 1:
+    #        qidx = self.std_model.index(idx, len(items))
+    #        assert qidx.isValid()
+    #        item = self.std_model.itemFromIndex(qidx)
+    #        self.set_item_properties(item, len(items), txid)
+    #        items.append(item)
+
+    @profiler
+    def update(self):
+        print('update called', traceback.extract_stack()[-4])
+        print('upper', traceback.extract_stack()[-5])
+        print('upper', traceback.extract_stack()[-6])
+        self.wallet = self.parent.wallet  # type: Abstract_Wallet
+        fx = self.parent.fx
+        r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=self.start_timestamp, to_timestamp=self.end_timestamp, fx=fx)
+        seen = set()
+        history = fx.show_history()
+        if r['transactions'] == list(self.transactions.values()):
+            return
+        #for i in range(self.std_model.columnCount()): self.hideColumn(i)
+        for idx, row in enumerate(r['transactions']):
+            txid = row['txid']
+            seen.add(txid)
+            if txid not in self.transactions:
+                self.transactions[txid] = row
+                self.transactions.move_to_end(txid, last=True)
+                self.insert_tx(row)
+                continue
+            old = self.transactions[txid]
+            self.update_item(txid, self.parent.wallet.get_tx_height(txid))
+            if history:
+                self.update_fiat(txid, row)
+            balance_str = self.parent.format_amount(row['balance'].value, whitespaces=True)
+            self.txid_to_items[txid][4].setText(balance_str)
+            old.clear()
+            old.update(**row)
+        #for i in range(self.std_model.columnCount()): self.showColumn(i)
+        removed = 0
+        for idx, txid in list(enumerate(self.transactions.keys())):
+            if txid not in seen:
+                del self.transactions[txid]
+                del self.txid_to_items[txid]
+                items = self.std_model.takeRow(idx - removed)
+                removed_txid = items[0].data(Qt.UserRole)
+                assert removed_txid == txid, (idx, removed)
+                removed += 1
+
+    def update_fiat(self, txid, row):
+        cap_gains = self.parent.fx.get_history_capital_gains_config()
+        items = self.txid_to_items[txid]
+        items[5].setForeground(self.blue_brush if not row['fiat_default'] and row['fiat_value'] else self.default_color)
+        value_str = self.parent.fx.format_fiat(row['fiat_value'].value)
+        items[5].setText(value_str)
+        # fixme: should use is_mine
+        if row['value'].value < 0 and cap_gains:
+            items[6].setText(self.parent.fx.format_fiat(row['acquisition_price'].value))
+            items[7].setText(self.parent.fx.format_fiat(row['capital_gain'].value))
+
+    def update_on_new_fee_histogram(self):
+        pass
+        # TODO update unconfirmed tx'es
+
+    def on_edited(self, index):
+        column = index.column()
+        index = self.proxy.mapToSource(index)
+        item = self.std_model.itemFromIndex(index)
+        key = item.data(Qt.UserRole)
+        text = item.text()
         # fixme
-        if column == 3:
+        if column == 2:
             self.parent.wallet.set_label(key, text)
             self.update_labels()
             self.parent.update_completions()
-        elif column == 6:
+        elif column == 5:
             self.parent.wallet.set_fiat_value(key, self.parent.fx.ccy, text)
-            self.on_update()
+            self.update_fiat(key, self.transactions[key])
 
     def on_doubleclick(self, item, column):
         if self.permit_edit(item, column):
@@ -311,13 +478,13 @@ class HistoryList(MyTreeWidget, AcceptFileDragDrop):
         self.parent.show_transaction(tx, label)
 
     def update_labels(self):
-        root = self.invisibleRootItem()
-        child_count = root.childCount()
+        root = self.std_model.invisibleRootItem()
+        child_count = root.rowCount()
         for i in range(child_count):
-            item = root.child(i)
-            txid = item.data(0, Qt.UserRole)
+            item = root.child(i, 2)
+            txid = item.data(Qt.UserRole)
             label = self.wallet.get_label(txid)
-            item.setText(3, label)
+            item.setText(label)
 
     def update_item(self, tx_hash, tx_mined_status):
         if self.wallet is None:
@@ -325,31 +492,26 @@ class HistoryList(MyTreeWidget, AcceptFileDragDrop):
         conf = tx_mined_status.conf
         status, status_str = self.wallet.get_tx_status(tx_hash, tx_mined_status)
         icon = self.icon_cache.get(":icons/" +  TX_ICONS[status])
-        items = self.findItems(tx_hash, Qt.MatchExactly, column=1)
-        if items:
-            item = items[0]
-            item.setIcon(0, icon)
-            item.setData(0, SortableTreeWidgetItem.DataRole, (status, conf))
-            item.setText(2, status_str)
+        if tx_hash not in self.txid_to_items:
+            return
+        items = self.txid_to_items[tx_hash]
+        items[0].setIcon(icon)
+        items[0].setToolTip(str(conf) + " confirmation" + ("s" if conf != 1 else ""))
+        items[0].setData((status, conf), SortableTreeWidgetItem.DataRole)
+        items[1].setText(status_str)
 
-    def create_menu(self, position):
-        self.selectedIndexes()
-        item = self.currentItem()
-        if not item:
-            return
-        column = self.currentColumn()
-        tx_hash = item.data(0, Qt.UserRole)
-        if not tx_hash:
-            return
+    def create_menu(self, position: QPoint):
+        idx: QModelIndex = self.indexAt(position)
+        idx = self.proxy.mapToSource(idx)
+        item: QStandardItem = self.std_model.itemFromIndex(idx)
+        assert item, 'create_menu: index not found in model'
+        column_data = item.text()
+        tx_hash = idx.data(Qt.UserRole)
+        column = idx.column()
+        assert tx_hash, "create_menu: no tx hash"
         tx = self.wallet.transactions.get(tx_hash)
-        if not tx:
-            return
-        if column is 0:
-            column_title = "ID"
-            column_data = tx_hash
-        else:
-            column_title = self.headerItem().text(column)
-            column_data = item.text(column)
+        assert tx, "create_menu: no tx"
+        column_title = self.std_model.horizontalHeaderItem(column).text()
         tx_URL = block_explorer_URL(self.config, 'tx', tx_hash)
         height = self.wallet.get_tx_height(tx_hash).height
         is_relevant, is_mine, v, fee = self.wallet.get_wallet_delta(tx)
@@ -360,8 +522,10 @@ class HistoryList(MyTreeWidget, AcceptFileDragDrop):
             menu.addAction(_("Remove"), lambda: self.remove_local_tx(tx_hash))
         menu.addAction(_("Copy {}").format(column_title), lambda: self.parent.app.clipboard().setText(column_data))
         for c in self.editable_columns:
-            menu.addAction(_("Edit {}").format(self.headerItem().text(c)),
-                           lambda bound_c=c: self.editItem(item, bound_c))
+            label = self.std_model.horizontalHeaderItem(c).text()
+            editIdx = idx.siblingAtColumn(c)
+            menu.addAction(_("Edit {}").format(label),
+                           lambda bound_c=c: self.edit(editIdx))
         menu.addAction(_("Details"), lambda: self.show_transaction(tx_hash))
         if is_unconfirmed and tx:
             # note: the current implementation of RBF *needs* the old tx fee
@@ -430,7 +594,7 @@ class HistoryList(MyTreeWidget, AcceptFileDragDrop):
         self.parent.show_message(_("Your wallet history has been successfully exported."))
 
     def do_export_history(self, file_name, is_csv):
-        history = self.transactions
+        history = self.transactions.values()
         lines = []
         if is_csv:
             for item in history:

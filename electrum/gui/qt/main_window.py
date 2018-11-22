@@ -313,6 +313,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, PrintError):
             self.show_error(str(e))
 
     def on_network(self, event, *args):
+        print("on_network", event)
         if event == 'wallet_updated':
             wallet = args[0]
             if wallet == self.wallet:
@@ -352,8 +353,7 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, PrintError):
             if self.config.is_dynfee():
                 self.fee_slider.update()
                 self.do_update_fee()
-            # todo: update only unconfirmed tx
-            self.history_list.update()
+            self.history_list.update_on_new_fee_histogram()
         else:
             self.print_error("unexpected network_qt signal:", event, args)
 
