@@ -75,18 +75,30 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
     filter_columns = [1, 2, 3]  # Date, Description, Amount
 
     def hide_row(self, proxy_row):
-        for column in self.filter_columns:
+        for column in [] if not self.current_filter else self.filter_columns:
             source_idx = self.proxy.mapToSource(self.proxy.index(proxy_row, column))
-            txt = self.std_model.itemFromIndex(source_idx).text().lower()
+            item = self.std_model.itemFromIndex(source_idx)
+            txt = item.text().lower()
             if self.current_filter in txt:
                 self.setRowHidden(proxy_row, QModelIndex(), False)
                 break
         else:
-            self.setRowHidden(proxy_row, QModelIndex(), True)
+            if self.start_timestamp and self.end_timestamp:
+                source_idx = self.proxy.mapToSource(self.proxy.index(proxy_row, 0))
+                item = self.std_model.itemFromIndex(source_idx)
+                txid = item.data(Qt.UserRole)
+                date = self.transactions[txid]['date']
+                if date and not (self.start_timestamp <= date <= self.end_timestamp):
+                    self.setRowHidden(proxy_row, QModelIndex(), True)
+                    return
+            self.setRowHidden(proxy_row, QModelIndex(), False)
 
     def filter(self, p):
         p = p.lower()
         self.current_filter = p
+        self.hide_rows()
+
+    def hide_rows(self):
         for row in range(self.proxy.rowCount()):
             self.hide_row(row)
 
@@ -131,7 +143,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
 
         self.wallet = self.parent.wallet  # type: Abstract_Wallet
         fx = self.parent.fx
-        r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=self.start_timestamp, to_timestamp=self.end_timestamp, fx=fx)
+        r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=None, to_timestamp=None, fx=fx)
         self.transactions.update([(x['txid'], x) for x in r['transactions']])
         self.summary = r['summary']
         if not self.years and self.transactions:
@@ -144,6 +156,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
             self.insert_tx(tx_item)
 
         self.sortByColumn(1, Qt.DescendingOrder)
+        self.toolbar_shown = False
 
     def keyPressEvent(self, event):
         if event.key() in [ Qt.Key_F2, Qt.Key_Return ]:
@@ -199,11 +212,33 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
             self.summary.clear()
         self.update()
 
-    def create_toolbar(self, config):
-        pass
+    def create_toolbar(self, config=None):
+        hbox = QHBoxLayout()
+        buttons = self.get_toolbar_buttons()
+        for b in buttons:
+            b.setVisible(False)
+            hbox.addWidget(b)
+        hide_button = QPushButton('x')
+        hide_button.setVisible(False)
+        hide_button.pressed.connect(lambda: self.show_toolbar(False, config))
+        self.toolbar_buttons = buttons + (hide_button,)
+        hbox.addStretch()
+        hbox.addWidget(hide_button)
+        return hbox
 
-    def show_toolbar(self, show):
-        pass
+    def show_toolbar(self, state, config=None):
+        if state == self.toolbar_shown:
+            return
+        self.toolbar_shown = state
+        if config:
+            self.save_toolbar_state(state, config)
+        for b in self.toolbar_buttons:
+            b.setVisible(state)
+        if not state:
+            self.on_hide_toolbar()
+
+    def toggle_toolbar(self, config=None):
+        self.show_toolbar(not self.toolbar_shown, config)
 
     def get_domain(self):
         '''Replaced in address_dialog.py'''
@@ -224,13 +259,11 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
                 year = int(s)
             except:
                 return
-            start_date = datetime.datetime(year, 1, 1)
-            end_date = datetime.datetime(year+1, 1, 1)
-            self.start_timestamp = time.mktime(start_date.timetuple())
-            self.end_timestamp = time.mktime(end_date.timetuple())
+            self.start_timestamp = start_date = datetime.datetime(year, 1, 1)
+            self.end_timestamp = end_date = datetime.datetime(year+1, 1, 1)
             self.start_button.setText(_('From') + ' ' + self.format_date(start_date))
             self.end_button.setText(_('To') + ' ' + self.format_date(end_date))
-        self.update()
+        self.hide_rows()
 
     def create_toolbar_buttons(self):
         self.period_combo = QComboBox()
@@ -249,18 +282,18 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
     def on_hide_toolbar(self):
         self.start_timestamp = None
         self.end_timestamp = None
-        self.update()
+        self.hide_rows()
 
     def save_toolbar_state(self, state, config):
         config.set_key('show_toolbar_history', state)
 
     def select_start_date(self):
         self.start_timestamp = self.select_date(self.start_button)
-        self.update()
+        self.hide_rows()
 
     def select_end_date(self):
         self.end_timestamp = self.select_date(self.end_button)
-        self.update()
+        self.hide_rows()
 
     def select_date(self, button):
         d = WindowModalDialog(self, _("Select date"))
@@ -280,7 +313,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
                 return None
             date = d.date.toPyDate()
             button.setText(self.format_date(date))
-            return time.mktime(date.timetuple())
+            return date
 
     def show_summary(self):
         h = self.summary
@@ -398,7 +431,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
         print('upper', traceback.extract_stack()[-6])
         self.wallet = self.parent.wallet  # type: Abstract_Wallet
         fx = self.parent.fx
-        r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=self.start_timestamp, to_timestamp=self.end_timestamp, fx=fx)
+        r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=None, to_timestamp=None, fx=fx)
         seen = set()
         history = fx.show_history()
         if r['transactions'] == list(self.transactions.values()):
