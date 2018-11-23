@@ -313,7 +313,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
                 return None
             date = d.date.toPyDate()
             button.setText(self.format_date(date))
-            return date
+            return datetime.datetime(date.year, date.month, date.day)
 
     def show_summary(self):
         h = self.summary
