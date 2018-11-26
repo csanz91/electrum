@@ -553,7 +553,6 @@ class Abstract_Wallet(AddressSynchronizer):
             else:
                 status = 2
         else:
-            assert isinstance(conf, int), conf
             status = 3 + min(conf, 6)
         time_str = format_time(timestamp) if timestamp else _("unknown")
         status_str = TX_STATUS[status] if status < 4 else time_str

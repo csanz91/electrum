@@ -23,9 +23,6 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
-import colorama
-import time
-import traceback
 import webbrowser
 import datetime
 from datetime import date
@@ -102,6 +99,11 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
         for row in range(self.proxy.rowCount()):
             self.hide_row(row)
 
+    def limit_confirmations(self, r):
+        for i in r['transactions']:
+            if 'confirmations' in i and i['confirmations'] >= 10:
+                i['confirmations'] = 10
+
     def __init__(self, parent=None):
         QTreeView.__init__(self, parent)
         self.txid_to_items = {}
@@ -144,6 +146,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
         self.wallet = self.parent.wallet  # type: Abstract_Wallet
         fx = self.parent.fx
         r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=None, to_timestamp=None, fx=fx)
+        self.limit_confirmations(r)
         self.transactions.update([(x['txid'], x) for x in r['transactions']])
         self.summary = r['summary']
         if not self.years and self.transactions:
@@ -186,7 +189,8 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
             self.editable_columns -= {5}
         if update:
             self.update_headers(headers)
-        self.std_model.setHorizontalHeaderLabels(headers)
+        else:
+            self.std_model.setHorizontalHeaderLabels(headers)
         self.header().setStretchLastSection(False)
         for col in range(len(headers)):
             sm = QHeaderView.Stretch if col == self.stretch_column else QHeaderView.ResizeToContents
@@ -203,13 +207,14 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
                 assert diff in [1, 3]
                 self.std_model.removeColumns(5, diff)
             for items in self.txid_to_items.values():
-                for _ in range(diff):
+                while len(items) > col_count:
                     items.pop()
         elif col_count < len(headers):
             self.std_model.clear()
             self.txid_to_items.clear()
             self.transactions.clear()
             self.summary.clear()
+        self.std_model.setHorizontalHeaderLabels(headers)
         self.update()
 
     def create_toolbar(self, config=None):
@@ -398,11 +403,6 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
         new_idx = self.std_model.index(source_row_idx, 0)
         history = self.parent.fx.show_history()
         if history:
-            cap_gains = self.parent.fx.get_history_capital_gains_config()
-            if not cap_gains:
-                self.ensure(item, 5, tx_hash)
-            else:
-                self.ensure(item, 7, tx_hash)
             self.update_fiat(tx_hash, tx_item)
         self.hide_row(self.proxy.mapFromSource(new_idx).row())
 
@@ -426,16 +426,26 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
 
     @profiler
     def update(self):
-        print('update called', traceback.extract_stack()[-4])
-        print('upper', traceback.extract_stack()[-5])
-        print('upper', traceback.extract_stack()[-6])
         self.wallet = self.parent.wallet  # type: Abstract_Wallet
         fx = self.parent.fx
         r = self.wallet.get_full_history(domain=self.get_domain(), from_timestamp=None, to_timestamp=None, fx=fx)
+        self.limit_confirmations(r)
         seen = set()
         history = fx.show_history()
-        if r['transactions'] == list(self.transactions.values()):
+        tx_list = list(self.transactions.values())
+        if r['transactions'] == tx_list:
             return
+        if r['transactions'][:-1] == tx_list:
+            print_error('history_list: just one new transaction')
+            row = r['transactions'][-1]
+            txid = row['txid']
+            if txid not in self.transactions:
+                self.transactions[txid] = row
+                self.transactions.move_to_end(txid, last=True)
+                self.insert_tx(row)
+                return
+            else:
+                print_error('history_list: tx added but txid is already in list (weird), txid: ', txid)
         #for i in range(self.std_model.columnCount()): self.hideColumn(i)
         for idx, row in enumerate(r['transactions']):
             txid = row['txid']
@@ -446,6 +456,8 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
                 self.insert_tx(row)
                 continue
             old = self.transactions[txid]
+            if old == row:
+                continue
             self.update_item(txid, self.parent.wallet.get_tx_height(txid))
             if history:
                 self.update_fiat(txid, row)
@@ -455,7 +467,8 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
             old.update(**row)
         #for i in range(self.std_model.columnCount()): self.showColumn(i)
         removed = 0
-        for idx, txid in list(enumerate(self.transactions.keys())):
+        l = list(enumerate(self.transactions.keys()))
+        for idx, txid in l:
             if txid not in seen:
                 del self.transactions[txid]
                 del self.txid_to_items[txid]
@@ -467,6 +480,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
     def update_fiat(self, txid, row):
         cap_gains = self.parent.fx.get_history_capital_gains_config()
         items = self.txid_to_items[txid]
+        self.ensure(items, 7 if cap_gains else 5, txid)
         items[5].setForeground(self.blue_brush if not row['fiat_default'] and row['fiat_value'] else self.default_color)
         value_str = self.parent.fx.format_fiat(row['fiat_value'].value)
         items[5].setText(value_str)
@@ -535,7 +549,11 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
             return
         items = self.txid_to_items[tx_hash]
         items[0].setIcon(icon)
-        items[0].setToolTip(str(conf) + " confirmation" + ("s" if conf != 1 else ""))
+        str_conf = str(conf)
+        if conf >= 10:
+            str_conf += '+'
+        tooltip = str_conf + " confirmation" + ("s" if conf != 1 else "")
+        items[0].setToolTip(tooltip)
         items[0].setData((status, conf), SortableTreeWidgetItem.DataRole)
         items[1].setText(status_str)
 
@@ -562,10 +580,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
         menu.addAction(_("Copy {}").format(column_title), lambda: self.parent.app.clipboard().setText(column_data))
         for c in self.editable_columns:
             label = self.std_model.horizontalHeaderItem(c).text()
-            def edit(c=c):
-                editIdx = org_idx.siblingAtColumn(c)
-                self.edit(editIdx)
-            menu.addAction(_("Edit {}").format(label), edit)
+            menu.addAction(_("Edit {}").format(label), partial(self.edit, org_idx.siblingAtColumn(c)))
         menu.addAction(_("Details"), lambda: self.show_transaction(tx_hash))
         if is_unconfirmed and tx:
             # note: the current implementation of RBF *needs* the old tx fee

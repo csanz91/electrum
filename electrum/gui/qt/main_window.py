@@ -313,7 +313,6 @@ class ElectrumWindow(QMainWindow, MessageBoxMixin, PrintError):
             self.show_error(str(e))
 
     def on_network(self, event, *args):
-        print("on_network", event)
         if event == 'wallet_updated':
             wallet = args[0]
             if wallet == self.wallet:
