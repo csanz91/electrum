@@ -200,6 +200,7 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
     def update_headers(self, headers):
         col_count = self.std_model.columnCount()
         diff = col_count-len(headers)
+        grew = False
         if col_count > len(headers):
             if diff == 2:
                 self.std_model.removeColumns(6, diff)
@@ -210,12 +211,13 @@ class HistoryList(QTreeView, AcceptFileDragDrop):
                 while len(items) > col_count:
                     items.pop()
         elif col_count < len(headers):
+            grew = True
             self.std_model.clear()
             self.txid_to_items.clear()
             self.transactions.clear()
             self.summary.clear()
         self.std_model.setHorizontalHeaderLabels(headers)
-        self.update()
+        if grew: self.update()
 
     def create_toolbar(self, config=None):
         hbox = QHBoxLayout()
