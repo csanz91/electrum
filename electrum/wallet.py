@@ -250,7 +250,12 @@ class Abstract_Wallet(AddressSynchronizer):
     def set_fiat_value(self, txid, ccy, text, fx, value):
         if txid not in self.transactions:
             return
-        def_fiat = Decimal(fx.format_fiat(self.default_fiat_value(txid, fx, value)))
+        # since fx is inserting the thousands separator,
+        # and not util, also have fx remove it
+        text = fx.remove_thousands_separator(text)
+        def_fiat_decimal = self.default_fiat_value(txid, fx, value)
+        formatted = fx.ccy_amount_str(def_fiat_decimal, commas=False)
+        def_fiat = Decimal(formatted)
         reset = not text
         if not reset:
             try:
